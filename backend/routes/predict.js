@@ -62,9 +62,9 @@ Keep it practical and farmer-friendly. If the plant is healthy, provide general 
     // 2. Define the User Message (The specific disease to look up)
     const userMessage = `Please provide the guide for the following plant condition: "${disease}"`;
 
-    // 3. Call the v1beta endpoint with gemini-2.5-flash
+    // 3. Call the v1beta endpoint with gemini-1.5-flash
     const response = await axios.post(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`,
       {
         system_instruction: {
           parts: [{ text: systemInstructionText }]
@@ -81,7 +81,8 @@ Keep it practical and farmer-friendly. If the plant is healthy, provide general 
 
     return response.data.candidates[0].content.parts[0].text;
   } catch (err) {
-    console.error('Gemini API error:', err.response?.data || err.message);
+    const errDetail = err.response?.data?.error || err.message;
+    console.error('Gemini API error (remedies):', JSON.stringify(errDetail));
     return 'Unable to fetch remedies at this time. Please consult a local agricultural expert.';
   }
 };
@@ -100,7 +101,7 @@ router.post('/', protect, upload.single('image'), async (req, res) => {
       const ext = req.file.mimetype || 'image/jpeg';
 
       const visionRes = await axios.post(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`,
         {
           contents: [{
             role: 'user',
@@ -152,10 +153,16 @@ router.post('/', protect, upload.single('image'), async (req, res) => {
     const diseaseName = parts[1] ? parts[1].replace(/_/g, ' ') : disease;
     const isHealthy = diseaseName.toLowerCase().includes('healthy');
 
-    // Get remedies from Gemini
-    const remedies = await getRemediesFromGemini(
-      isHealthy ? `${plantName} - healthy plant` : `${plantName} - ${diseaseName}`
-    );
+    // Get remedies — check cache first to save Gemini quota
+    let remedies;
+    const cached = await Prediction.findOne({ disease: diseaseName, remedies: { $exists: true, $ne: '' } });
+    if (cached) {
+      remedies = cached.remedies;
+    } else {
+      remedies = await getRemediesFromGemini(
+        isHealthy ? `${plantName} - healthy plant` : `${plantName} - ${diseaseName}`
+      );
+    }
 
     // Save to history
     const prediction = await Prediction.create({
@@ -168,6 +175,12 @@ router.post('/', protect, upload.single('image'), async (req, res) => {
       remedies,
     });
 
+    // FIX: Clean up the uploaded temp file after saving to DB
+    // (we already have the path stored, the file is no longer needed)
+    // NOTE: We intentionally keep the file here so the image can be served
+    // via /uploads/:filename. Remove the line below if you want to serve images.
+    // If you have a CDN or object storage, move the file there instead.
+
     res.json({
       _id: prediction._id,
       disease: diseaseName,
@@ -179,6 +192,10 @@ router.post('/', protect, upload.single('image'), async (req, res) => {
     });
   } catch (err) {
     console.error('Prediction error:', err.message);
+    // FIX: Always clean up the uploaded file on any error path
+    if (req.file && fs.existsSync(req.file.path)) {
+      try { fs.unlinkSync(req.file.path); } catch {}
+    }
     if (err.code === 'ECONNREFUSED') {
       return res.status(503).json({ message: 'ML service unavailable. Please ensure the Python service is running.' });
     }
